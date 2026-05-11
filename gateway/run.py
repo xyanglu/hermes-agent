@@ -1181,6 +1181,10 @@ class GatewayRunner:
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
 
+        # Dead-letter queue for messages lost to 429/rate limits
+        self._dead_letter_path = os.path.expanduser("~/.hermes/dead_letter_queue.json")
+        self._dead_letter_lock = threading.Lock()
+
         # Wire process registry into session store for reset protection
         from tools.process_registry import process_registry
         self.session_store = SessionStore(
@@ -6383,6 +6387,9 @@ class GatewayRunner:
 
         if canonical == "retry":
             return await self._handle_retry_command(event)
+
+        if canonical == "queued":
+            return await self._handle_queued_command(event)
         
         if canonical == "undo":
             async def _do_undo():
@@ -7905,11 +7912,21 @@ class GatewayRunner:
                     )
                 elif status_code == 400:
                     status_hint = " The request was rejected by the API."
+            # Enqueue in dead-letter queue for 429/529/rate-limit errors
+            if status_code in (429, 529) or "rate" in error_detail.lower() or "overloaded" in error_detail.lower():
+                try:
+                    self._dlq_enqueue(event, source, message_text, error_detail)
+                except Exception:
+                    logger.debug("Failed to enqueue message in dead-letter queue", exc_info=True)
+                dlq_hint = "\nYour message has been saved. Use /queued to list and retry when rate limits reset."
+            else:
+                dlq_hint = ""
             return (
                 f"Sorry, I encountered an error ({error_type}).\n"
                 f"{error_detail}\n"
                 f"{status_hint}"
                 "Try again or use /reset to start a fresh session."
+                f"{dlq_hint}"
             )
         finally:
             # Restore session context variables to their pre-handler state
@@ -9222,6 +9239,133 @@ class GatewayRunner:
 
         available = "`none`, " + ", ".join(f"`{n}`" for n in personalities)
         return t("gateway.personality.unknown", name=args, available=available)
+
+    # ────────────────────────────────────────────────────────────────
+    # Dead-letter queue — messages lost to 429/rate limits
+    # ────────────────────────────────────────────────────────────────
+    def _dlq_load(self) -> list:
+        """Load the dead-letter queue from disk."""
+        try:
+            if os.path.exists(self._dead_letter_path):
+                with open(self._dead_letter_path, "r") as f:
+                    return json.load(f)
+        except Exception:
+            logger.debug("Failed to load dead-letter queue", exc_info=True)
+        return []
+
+    def _dlq_save(self, queue: list) -> None:
+        """Persist the dead-letter queue to disk."""
+        try:
+            with self._dead_letter_lock:
+                with open(self._dead_letter_path, "w") as f:
+                    json.dump(queue, f, indent=2, ensure_ascii=False)
+        except Exception:
+            logger.debug("Failed to save dead-letter queue", exc_info=True)
+
+    def _dlq_enqueue(self, event, source, message_text: str, error_detail: str) -> None:
+        """Add a failed message to the dead-letter queue."""
+        entry = {
+            "id": datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+            "timestamp": datetime.now().isoformat(),
+            "platform": source.platform.value if hasattr(source.platform, "value") else str(source.platform),
+            "chat_id": str(source.chat_id or ""),
+            "user_name": source.user_name or "",
+            "session_key": source.user_id or source.chat_id or "",
+            "message": message_text[:2000],
+            "error": error_detail[:500],
+            "retries": 0,
+        }
+        queue = self._dlq_load()
+        # Deduplicate: don't re-queue the same message text within 60s
+        for existing in queue:
+            if (existing.get("message") == entry["message"]
+                    and existing.get("chat_id") == entry["chat_id"]):
+                elapsed = (datetime.fromisoformat(entry["timestamp"])
+                           - datetime.fromisoformat(existing["timestamp"])).total_seconds()
+                if elapsed < 60:
+                    logger.debug("Skipping DLQ duplicate for chat %s", entry["chat_id"])
+                    return
+        queue.append(entry)
+        self._dlq_save(queue)
+        logger.info("Dead-letter queue: added message from %s (queue depth: %d)",
+                     entry["platform"], len(queue))
+
+    async def _dlq_notify_if_pending(self) -> None:
+        """Send a notification if there are queued messages."""
+        queue = self._dlq_load()
+        if not queue:
+            return
+        # Notify on the first available adapter
+        for platform, adapter in self.adapters.items():
+            try:
+                # Find home chat_id for this platform
+                home_chat = None
+                if hasattr(adapter, '_config'):
+                    home_chat = adapter._config.get("home_chat_id") or adapter._config.get("chat_id")
+                if not home_chat:
+                    continue
+                msg = (
+                    f"You have {len(queue)} message(s) in the dead-letter queue "
+                    f"(lost to rate limits). Use /queued to list and retry them."
+                )
+                await adapter.send(home_chat, msg)
+                break
+            except Exception:
+                continue
+
+    async def _handle_queued_command(self, event) -> Optional[str]:
+        """Handle /queued command -- list and retry dead-letter messages."""
+        args = (event.text or "").strip().split(None, 1)
+        subcmd = args[1].strip().lower() if len(args) > 1 else ""
+
+        queue = self._dlq_load()
+
+        if subcmd in ("clear", "purge"):
+            self._dlq_save([])
+            return f"Cleared {len(queue)} message(s) from the dead-letter queue."
+
+        if subcmd in ("retry", "r", "all"):
+            if not queue:
+                return "Dead-letter queue is empty."
+            results = []
+            remaining = []
+            for entry in queue:
+                try:
+                    source = event.source
+                    retry_event = MessageEvent(
+                        text=entry["message"],
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        raw_message=event.raw_message,
+                        channel_prompt=event.channel_prompt,
+                    )
+                    # Fire-and-forget: process the queued message
+                    result = await self._handle_message(retry_event)
+                    status = "sent" if result else "processed"
+                    results.append(f"- [{entry['timestamp'][:16]}] {entry['message'][:60]}... -> {status}")
+                except Exception as e:
+                    remaining.append(entry)
+                    results.append(f"- [{entry['timestamp'][:16]}] {entry['message'][:60]}... -> FAILED: {e}")
+            if remaining:
+                self._dlq_save(remaining)
+                results.append(f"\n{len(remaining)} message(s) still in queue (retry failed).")
+            else:
+                self._dlq_save([])
+                results.append(f"\nAll {len(queue)} message(s) retried successfully.")
+            return "\n".join(results)
+
+        # Default: list
+        if not queue:
+            return "Dead-letter queue is empty. No messages lost to rate limits."
+        lines = [f"Dead-letter queue ({len(queue)} message(s)):"]
+        lines.append("Use /queued retry to retry all, /queued clear to discard.\n")
+        for i, entry in enumerate(queue):
+            preview = entry["message"][:80].replace("\n", " ")
+            lines.append(
+                f"{i+1}. [{entry['timestamp'][:16]} "
+                f"({entry['platform']}) {preview}..."
+            )
+        return "\n".join(lines)
 
     async def _handle_retry_command(self, event: MessageEvent) -> str:
         """Handle /retry command - re-send the last user message."""

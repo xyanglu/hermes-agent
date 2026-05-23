@@ -2356,10 +2356,30 @@ def run_conversation(
                             except (TypeError, ValueError):
                                 if isinstance(_reset_at, str) and _reset_at.strip():
                                     _reset_hint = f" (resets at {_reset_at[:40]})"
-                        agent._emit_status(f"⚠️ Rate limited — switching to fallback provider...{_reset_hint}")
-                        if agent._try_activate_fallback(reason=classified.reason):
-                            agent._hit_rate_limit = False  # Fallback will handle it
-                            retry_count = 0
+                        # If we have a known reset time and the rate-limit queue
+                        # is enabled, skip fallback entirely.  The gateway will
+                        # queue the message and retry on the primary model when
+                        # the reset time passes — avoids quality degradation,
+                        # reasoning_content errors, and user confusion from
+                        # switching to a weaker fallback provider.
+                        _skip_fallback = bool(
+                            _reset_at
+                            and (
+                                os.environ.get("HERMES_GATEWAY_RATE_LIMIT_QUEUE", "").lower()
+                                in ("true", "1", "yes")
+                            )
+                        )
+                        if _skip_fallback:
+                            agent._rate_limit_reset_at = _reset_at
+                            agent._emit_status(
+                                f"⏳ Rate limited{_reset_hint} — "
+                                f"queued for retry on {agent.model}"
+                            )
+                        else:
+                            agent._emit_status(f"⚠️ Rate limited — switching to fallback provider...{_reset_hint}")
+                            if agent._try_activate_fallback(reason=classified.reason):
+                                agent._hit_rate_limit = False  # Fallback will handle it
+                                retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False
                             continue

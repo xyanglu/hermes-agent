@@ -1182,23 +1182,18 @@ class SignalAdapter(BasePlatformAdapter):
                             attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
                         )
                     else:
-                        # Assume the server didn't accept the batch, don't deduce tokens
-                        logger.error(
-                            "Signal: RPC send failed for batch %d/%d (%d attachments, "
-                            "attempt %d/%d, rpc_duration=%.1fs)",
+                        # _rpc returned None — signal-cli didn't confirm. This can
+                        # happen when signal-cli accepts the send but its HTTP
+                        # response is lost (timeout, EOF, etc.). Retrying here would
+                        # deliver a duplicate. Instead, assume delivery and move on.
+                        logger.warning(
+                            "Signal: RPC send returned None for batch %d/%d "
+                            "(%d attachments, attempt %d/%d, rpc_duration=%.1fs) "
+                            "— treating as delivered to avoid duplicates",
                             idx + 1, len(att_batches), n,
                             attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
                             _rpc_duration,
                         )
-                        # Retry transient (non-rate-limit) failures once
-                        if attempt < SIGNAL_RATE_LIMIT_MAX_ATTEMPTS:
-                            backoff = 2.0 ** attempt
-                            logger.info(
-                                "Signal: retrying batch %d/%d after %.1fs backoff",
-                                idx + 1, len(att_batches), backoff,
-                            )
-                            await asyncio.sleep(backoff)
-                            continue
                     break
                 except SignalRateLimitError as e:
                     scheduler.feedback(e.retry_after, n)

@@ -1414,6 +1414,7 @@ class GatewayRunner:
     _draining: bool = False
     _restart_requested: bool = False
     _rate_limited_sessions: Dict[str, float] = {}  # session_key -> timestamp when 429 hit
+    _rate_limit_reset_sessions: Dict[str, float] = {}  # session_key -> epoch seconds when rate limit clears
     _rate_limit_queue_enabled: bool = False
     _rate_limit_queue_max_depth: int = 5
     _restart_task_started: bool = False
@@ -1444,6 +1445,7 @@ class GatewayRunner:
         self._rate_limit_queue_enabled = self._load_rate_limit_queue_enabled()
         self._rate_limit_queue_max_depth = self._load_rate_limit_queue_max_depth()
         self._rate_limited_sessions: Dict[str, float] = {}
+        self._rate_limit_reset_sessions: Dict[str, float] = {}
         self._rate_limit_queued_events: Dict[str, list] = {}  # session -> [MessageEvent, ...]
 
         # Wire process registry into session store for reset protection
@@ -2378,17 +2380,40 @@ class GatewayRunner:
 
     # ── Rate-limit queue helpers ────────────────────────────────────
 
-    def _mark_session_rate_limited(self, session_key: str) -> None:
-        """Flag a session as rate-limited. Called from post-run path."""
+    def _mark_session_rate_limited(self, session_key: str, reset_at: float | None = None) -> None:
+        """Flag a session as rate-limited. Called from post-run path.
+
+        When ``reset_at`` (epoch seconds) is provided, the session will
+        automatically un-rate-limit once that time passes — the queue
+        check (``_is_session_rate_limited``) compares against the current
+        clock so no timer or cron job is needed.
+        """
         self._rate_limited_sessions[session_key] = time.time()
+        if reset_at is not None and reset_at > 0:
+            self._rate_limit_reset_sessions[session_key] = reset_at
 
     def _clear_session_rate_limited(self, session_key: str) -> None:
         """Clear rate-limit flag for a session."""
         self._rate_limited_sessions.pop(session_key, None)
+        self._rate_limit_reset_sessions.pop(session_key, None)
 
     def _is_session_rate_limited(self, session_key: str) -> bool:
-        """Check if a session is currently rate-limited."""
-        return session_key in self._rate_limited_sessions
+        """Check if a session is currently rate-limited.
+
+        If a known reset-at time has passed, auto-clears the flag so the
+        next incoming message flows straight through to the primary model.
+        This eliminates the need for a separate timer or cron job — the
+        check happens on every message at queue time.
+        """
+        if session_key not in self._rate_limited_sessions:
+            return False
+        # Check if the rate limit has expired (known reset time)
+        reset_at = self._rate_limit_reset_sessions.get(session_key)
+        if reset_at is not None and time.time() >= reset_at:
+            # Reset time passed — auto-clear and let messages through
+            self._clear_session_rate_limited(session_key)
+            return False
+        return True
 
     def _rate_limit_queue_enabled_for_session(self, session_key: str) -> bool:
         """Check if rate-limit queueing is active for a specific session."""
@@ -9176,6 +9201,7 @@ class GatewayRunner:
 
         # Clear rate-limit queue state for this session.
         self._rate_limited_sessions.pop(session_key, None)
+        self._rate_limit_reset_sessions.pop(session_key, None)
         _rlqe = getattr(self, "_rate_limit_queued_events", None)
         if _rlqe is not None:
             _rlqe.pop(session_key, None)
@@ -17468,7 +17494,15 @@ class GatewayRunner:
                         "Session %s hit rate limit — enabling message queueing",
                         session_key,
                     )
-                self._mark_session_rate_limited(session_key)
+                _reset_at = getattr(_agent, "_rate_limit_reset_at", None)
+                if _reset_at is not None:
+                    _reset_ts = (
+                        float(_reset_at) / 1000 if _reset_at > 1000000000000
+                        else float(_reset_at)
+                    )
+                else:
+                    _reset_ts = None
+                self._mark_session_rate_limited(session_key, reset_at=_reset_ts)
 
             # Clear rate-limit flag on successful completion or if fallback
             # was activated (the fallback provider handled the request).

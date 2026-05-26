@@ -272,6 +272,59 @@ def _strip_images_from_content(content: Any) -> Any:
     return new_parts
 
 
+_VOICE_MSG_PATTERN = re.compile(
+    r"\[The user sent a voice message[~:]?\s*Here's what they said:\s*\"(.+?)\"\]",
+    re.DOTALL,
+)
+
+
+def _extract_voice_transcripts(
+    turns: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Extract voice message transcriptions from message turns.
+
+    Returns a list of dicts with ``timestamp`` and ``transcript`` keys for
+    every user message that contains a voice-message transcription marker.
+
+    Used by ``ContextCompressor.compress()`` to preserve voice transcripts
+    across context compression -- without this, voice messages are
+    summarized away and the agent loses access to what the user said.
+    """
+    transcripts: List[Dict[str, Any]] = []
+    for msg in turns:
+        if msg.get("role") != "user":
+            continue
+        content = _content_text_for_contains(msg.get("content"))
+        if not content:
+            continue
+        for m in _VOICE_MSG_PATTERN.finditer(content):
+            transcript = m.group(1).strip()
+            if transcript:
+                transcripts.append(
+                    {
+                        "transcript": transcript,
+                        "timestamp": msg.get("timestamp"),
+                    }
+                )
+    return transcripts
+
+
+def _build_voice_appendix(
+    transcripts: List[Dict[str, Any]],
+) -> str:
+    """Build a compact appendix of voice message transcriptions.
+
+    Designed to be appended to the compression summary so voice
+    transcripts survive context window compression.
+    """
+    if not transcripts:
+        return ""
+    lines = ["## Voice Message Log (preserved across compression)"]
+    for t in transcripts:
+        lines.append(f"- \"{t['transcript']}\"")
+    return "\n".join(lines)
+
+
 def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Replace image parts in older messages with placeholder text.
 
@@ -609,6 +662,7 @@ class ContextCompressor(ContextEngine):
         """Update tracked token usage from API response."""
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
         self.last_completion_tokens = usage.get("completion_tokens", 0)
+        self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """Check if context exceeds the compression threshold.
@@ -897,7 +951,7 @@ class ContextCompressor(ContextEngine):
         into the warning log.
         """
         self._summary_model_fallen_back = True
-        logging.warning(
+        logger.warning(
             "Summary model '%s' %s (%s). "
             "Falling back to main model '%s' for compression.",
             self.summary_model, reason, e, self.model,
@@ -1086,7 +1140,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             # No provider configured — long cooldown, unlikely to self-resolve
             self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
             self._last_summary_error = "no auxiliary LLM provider configured"
-            logging.warning("Context compression: no provider available for "
+            logger.warning("Context compression: no provider available for "
                             "summary. Middle turns will be dropped without summary "
                             "for %d seconds.",
                             _SUMMARY_FAILURE_COOLDOWN_SECONDS)
@@ -1182,7 +1236,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             if len(err_text) > 220:
                 err_text = err_text[:217].rstrip() + "..."
             self._last_summary_error = err_text
-            logging.warning(
+            logger.warning(
                 "Failed to generate context summary: %s. "
                 "Further summary attempts paused for %d seconds.",
                 e,
@@ -1658,6 +1712,25 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 f"messages contained earlier work in this session. Continue based on the "
                 f"recent messages below and the current state of any files or resources."
             )
+
+        # Phase 3.5: Preserve voice message transcriptions across compression.
+        # Voice messages are transcribed by the gateway STT pipeline and
+        # embedded in user message content as "[The user sent a voice
+        # message~ Here's what they said: "..."]".  Without explicit
+        # preservation, the LLM summarizer may drop or paraphrase these
+        # transcriptions, and the agent loses the user's exact words.
+        # We extract them verbatim and append as a compact appendix to
+        # whatever summary was produced (LLM-generated or fallback).
+        voice_transcripts = _extract_voice_transcripts(turns_to_summarize)
+        if voice_transcripts:
+            voice_appendix = _build_voice_appendix(voice_transcripts)
+            if voice_appendix:
+                summary = summary + "\n\n" + voice_appendix
+                if not self.quiet_mode:
+                    logger.info(
+                        "Preserved %d voice transcript(s) in compression summary",
+                        len(voice_transcripts),
+                    )
 
         _merge_summary_into_tail = False
         last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"
